@@ -1,34 +1,41 @@
 
-from tasks import extract_file_from_zip
-from celery import Celery
-from celery.result import AsyncResult
-celery_app = Celery("tasks", broker="redis://localhost:6379/0", backend="redis://localhost:6379/0")
-from utils import logger, extract_zip_file, count_valid_images
+# from celery import Celery
+# from celery.result import AsyncResult
+# celery_app = Celery("tasks", broker="redis://localhost:6379/0", backend="redis://localhost:6379/0")
+from utils.utils import logger, extract_zip_file, count_valid_images
 from fastapi import FastAPI, File, UploadFile, HTTPException
 import os
 import tempfile
 
 app = FastAPI()
 
+
+async def extract_file_from_zip(file):
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        # Save the zip file to disk
+        file_path = os.path.join(temp_dir, file.filename)
+        logger.debug(f"File path: {file_path}")
+        with open(file_path, "wb") as f:
+            contents = await file.read()
+            f.write(contents)
+
+        # Extract the contents of the zip file
+        extracted_folder_path = extract_zip_file(file_path, temp_dir)
+
+        # Check if the extracted folder contains valid images
+        num_images = count_valid_images(extracted_folder_path)
+
+    return {"status": "success", "num_images": num_images, "folder_path": extracted_folder_path}
+
+
+
+
 @app.post("/uploadfile/")
-def upload_file(file: UploadFile = File(...)):
+async def upload_file(file: UploadFile = File(...)):
     # Check that the uploaded file is a zip file
     if not file.filename.endswith('.zip'):
         raise HTTPException(status_code=400, detail="Invalid file type")
 
-    upload_task = extract_file_from_zip.delay(file)
-    return {"task_id": upload_task.id}
-
-@app.get("/task_status/{task_id}")
-async def task_status(task_id: str):
-    async_result = AsyncResult(task_id, app=celery_app)
-    if async_result.state == "PENDING":
-        raise HTTPException(status_code=404, detail="Task not found")
-    elif async_result.state in ["SUCCESS", "FAILURE"]:
-        return {
-            "task_id": task_id,
-            "status": async_result.state,
-            "result": async_result.result,
-        }
-    else:
-        return {"task_id": task_id, "status": async_result.state}
+    return await extract_file_from_zip(file)
+    
