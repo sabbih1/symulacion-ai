@@ -53,8 +53,8 @@ tokenizer = CLIPTokenizer.from_pretrained(
     subfolder="tokenizer",
 )
 class TrainingArgs(BaseModel):
-    pretrained_model_name_or_path: str
-    resolution: int
+    pretrained_model_name_or_path: str = "runwayml/stable-diffusion-v1-5"
+    resolution: int = 512
     center_crop: bool = False
     train_text_encoder: bool = False
     instance_data_dir: str
@@ -69,11 +69,11 @@ class TrainingArgs(BaseModel):
     gradient_checkpointing: bool = True
     use_8bit_adam: bool = True
     seed: int = 3434554
-    with_prior_preservation: bool
-    prior_loss_weight: float
+    with_prior_preservation: bool = False
+    prior_loss_weight: float = 0.5
     sample_batch_size: int = 2
-    class_data_dir: str
-    class_prompt: str
+    class_data_dir: str = ""
+    class_prompt: str = ""
     num_class_images: int
     lr_scheduler: str = "constant"
     lr_warmup_steps: int = 100
@@ -175,6 +175,7 @@ class PromptDataset(Dataset):
 from accelerate.utils import set_seed
 def training_function(text_encoder, vae, unet, args: TrainingArgs):
     logger = get_logger(__name__)
+    print("*******************************", args.pretrained_model_name_or_path )
 
     set_seed(args.seed)
 
@@ -215,7 +216,6 @@ def training_function(text_encoder, vae, unet, args: TrainingArgs):
         params_to_optimize,
         lr=args.learning_rate,
     )
-
     noise_scheduler = DDPMScheduler.from_config(args.pretrained_model_name_or_path, subfolder="scheduler")
     
     train_dataset = DreamBoothDataset(
