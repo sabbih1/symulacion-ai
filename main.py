@@ -7,44 +7,50 @@ import tempfile
 import accelerate
 import itertools
 import torch
+import redis # Connect to a local redis instance
 
-from fastapi import FastAPI, File, UploadFile, HTTPException
-
+from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks
 from pydantic import BaseModel
 from typing import Optional
 from services.dreambooth import TrainingArgs, training_function, text_encoder, vae, unet
 from utils.utils import logger, extract_zip_file, count_valid_images
 from config import DATA_EXTRACTION_PATH
+from celery import Celery, signals
 
 app = FastAPI()
+r = redis.Redis(host = 'localhost', port = 6379, db = 0)
 
 async def extract_file_from_zip(file):
     # Save the zip file to disk
     file_path = os.path.join(DATA_EXTRACTION_PATH, file.filename)
+    complete_folder_path = file_path.split(".zip")[0]
     with open(file_path, "wb") as f:
         contents = await file.read()
         f.write(contents)
     logger.debug(f"File path: {file_path}")
+    # # Extract the contents of the zip file
+    extracted_folder_path = extract_zip_file(file_path, complete_folder_path)
 
-    # Extract the contents of the zip file
-    extracted_folder_path = extract_zip_file(file_path, DATA_EXTRACTION_PATH)
-
-    # Check if the extracted folder contains valid images
+    # # Check if the extracted folder contains valid images
     num_images = count_valid_images(extracted_folder_path)
+    event = {"status": "success", "num_images": num_images, "folder_path": extracted_folder_path}
+    logger.debug(f"{event}")
 
-    return {"status": "success", "num_images": num_images, "folder_path": extracted_folder_path}
+    r.xadd("data_upload_messages", event, '*')
 
 
+class TaskResponse(BaseModel):
+    task_id: str
 
 
-@app.post("/uploadfile/")
-async def upload_file(file: UploadFile = File(...)):
+@app.post("/uploadfile/", response_model=TaskResponse)
+async def upload_file(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
     # Check that the uploaded file is a zip file
     if not file.filename.endswith('.zip'):
         raise HTTPException(status_code=400, detail="Invalid file type")
-
-    return await extract_file_from_zip(file)
-
+    return background_tasks.add_task(extract_file_from_zip, file)
+    # task = celery_app.send_task("extract_file_from_zip", args=(file,))
+    
 
 @app.post("/train")
 async def train_model(training_args: TrainingArgs):
