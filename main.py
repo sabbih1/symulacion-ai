@@ -1,7 +1,6 @@
 
 # from celery import Celery
 # from celery.result import AsyncResult
-# celery_app = Celery("tasks", broker="redis://localhost:6379/0", backend="redis://localhost:6379/0")
 import os
 import tempfile
 import accelerate
@@ -18,6 +17,7 @@ from config import DATA_EXTRACTION_PATH
 from celery import Celery, signals
 
 app = FastAPI()
+celery_app = Celery("tasks", broker="redis://localhost:6379/0", backend="redis://localhost:6379/0")
 r = redis.Redis(host = 'localhost', port = 6379, db = 0)
 
 async def extract_file_from_zip(file):
@@ -50,13 +50,22 @@ async def upload_file(background_tasks: BackgroundTasks, file: UploadFile = File
         raise HTTPException(status_code=400, detail="Invalid file type")
     return background_tasks.add_task(extract_file_from_zip, file)
     # task = celery_app.send_task("extract_file_from_zip", args=(file,))
-    
 
-@app.post("/train")
-async def train_model(training_args: TrainingArgs):
-    # Your training code here using the provided training_args
+
+@celery_app.task
+def call_accelerate(training_args: TrainingArgs):
     accelerate.notebook_launcher(training_function, args=(text_encoder, vae, unet, training_args), num_processes=1)
+    '''
+    After the training is completed, the code iterates through the parameters of the unet and text_encoder models.
+    It deletes the gradient tensors associated with each parameter to free up some GPU memory.
+    '''
     for param in itertools.chain(unet.parameters(), text_encoder.parameters()):
         if param.grad is not None:
             del param.grad  # free some memory
         torch.cuda.empty_cache()
+
+
+@app.post("/train")
+async def train_model(training_args: TrainingArgs):
+    # Your training code here using the provided training_args
+    task = celery_app.send_task("call_accelerate", args=(training_args,))
