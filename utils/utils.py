@@ -34,9 +34,11 @@ class ModelID(Enum):
 
 
 def extract_zip_file(zip_file_path, temp_dir):
+    if not os.path.exists(temp_dir): os.makedirs(temp_dir)
     with zipfile.ZipFile(zip_file_path) as zip_file:
         zip_file.extractall(temp_dir)
         subdirs = [f.path for f in os.scandir(temp_dir) if f.is_dir()]
+        print("subdirs", subdirs)
         if len(subdirs) != 1:
             raise HTTPException(status_code=400, detail="Zip file does not contain a single folder")
         extracted_folder_path = subdirs[0]
