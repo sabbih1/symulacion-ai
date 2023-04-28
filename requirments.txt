@@ -1,0 +1,5 @@
+fastapi
+torch==1.13.1+cu117
+redis==5.0.0b2
+celery
+accelerate
