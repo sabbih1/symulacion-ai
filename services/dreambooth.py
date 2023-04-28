@@ -1,4 +1,16 @@
-import PIL
+
+import bitsandbytes as bnb
+import argparse
+import itertools
+import math
+import os
+from contextlib import nullcontext
+import random
+import numpy as np
+import torch
+import torch.nn.functional as F
+import torch.utils.checkpoint
+
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import set_seed
@@ -9,30 +21,17 @@ from PIL import Image
 from torchvision import transforms
 from tqdm.auto import tqdm
 from transformers import CLIPFeatureExtractor, CLIPTextModel, CLIPTokenizer
-
-import bitsandbytes as bnb
-import argparse
-import itertools
-import math
-import os
-from contextlib import nullcontext
-import random
-
-import numpy as np
-import torch
-import torch.nn.functional as F
-import torch.utils.checkpoint
+from diffusers import DPMSolverMultistepScheduler
 from torch.utils.data import Dataset
-
+from utils.utils import TorchDtype
 
 from pathlib import Path
 from torchvision import transforms
 from PIL import Image
 from torch.utils.data import Dataset
 
-from pydantic import BaseModel
 
-
+from models.text2img.model import TrainingArgs
 from config import MODEL_ID_OR_PATH
 
 
@@ -52,32 +51,6 @@ tokenizer = CLIPTokenizer.from_pretrained(
     MODEL_ID_OR_PATH,
     subfolder="tokenizer",
 )
-class TrainingArgs(BaseModel):
-    pretrained_model_name_or_path: str
-    resolution: int
-    center_crop: bool = False
-    train_text_encoder: bool = False
-    instance_data_dir: str
-    instance_prompt: str
-    learning_rate: float = 5e-07
-    max_train_steps: int = 200
-    save_steps: int = 50
-    train_batch_size: int = 2
-    gradient_accumulation_steps: int = 2
-    max_grad_norm: float = 1.0
-    mixed_precision: str = "fp16"
-    gradient_checkpointing: bool = True
-    use_8bit_adam: bool = True
-    seed: int = 3434554
-    with_prior_preservation: bool
-    prior_loss_weight: float
-    sample_batch_size: int = 2
-    class_data_dir: str
-    class_prompt: str
-    num_class_images: int
-    lr_scheduler: str = "constant"
-    lr_warmup_steps: int = 100
-    output_dir: str = "dreambooth-concept"
 
 
 
@@ -110,6 +83,7 @@ class DreamBoothDataset(Dataset):
             self.class_data_root = Path(class_data_root)
             self.class_data_root.mkdir(parents=True, exist_ok=True)
             self.class_images_path = list(Path(class_data_root).iterdir())
+            print("DEBUG: ", self.class_images_path, class_data_root)
             self.num_class_images = len(self.class_images_path)
             self._length = max(self.num_class_images, self.num_instance_images)
             self.class_prompt = class_prompt
@@ -173,59 +147,59 @@ class PromptDataset(Dataset):
 
 #@title Training function
 from accelerate.utils import set_seed
-def training_function(text_encoder, vae, unet, args: TrainingArgs):
+def training_function(text_encoder, vae, unet, args: dict):
     logger = get_logger(__name__)
 
-    set_seed(args.seed)
+    set_seed(args["seed"])
 
     accelerator = Accelerator(
-        gradient_accumulation_steps=args.gradient_accumulation_steps,
-        mixed_precision=args.mixed_precision,
+        gradient_accumulation_steps=args["gradient_accumulation_steps"],
+        mixed_precision=args["mixed_precision"],
     )
 
     # Currently, it's not possible to do gradient accumulation when training two models with accelerate.accumulate
     # This will be enabled soon in accelerate. For now, we don't allow gradient accumulation when training two models.
     # TODO (patil-suraj): Remove this check when gradient accumulation with two models is enabled in accelerate.
-    if args.train_text_encoder and args.gradient_accumulation_steps > 1 and accelerator.num_processes > 1:
+    if args["train_text_encoder"] and args["gradient_accumulation_steps"] > 1 and accelerator.num_processes > 1:
         raise ValueError(
             "Gradient accumulation is not supported when training the text encoder in distributed training. "
             "Please set gradient_accumulation_steps to 1. This feature will be supported in the future."
         )
 
     vae.requires_grad_(False)
-    if not args.train_text_encoder:
+    if not args["train_text_encoder"]:
         text_encoder.requires_grad_(False)
 
-    if args.gradient_checkpointing:
+    if args["gradient_checkpointing"]:
         unet.enable_gradient_checkpointing()
-        if args.train_text_encoder:
+        if args["train_text_encoder"]:
             text_encoder.gradient_checkpointing_enable()
 
     # Use 8-bit Adam for lower memory usage or to fine-tune the model in 16GB GPUs
-    if args.use_8bit_adam:
+    if args["use_8bit_adam"]:
         optimizer_class = bnb.optim.AdamW8bit
     else:
         optimizer_class = torch.optim.AdamW
     
     params_to_optimize = (
-        itertools.chain(unet.parameters(), text_encoder.parameters()) if args.train_text_encoder else unet.parameters()
+        itertools.chain(unet.parameters(), text_encoder.parameters()) if args["train_text_encoder"] else unet.parameters()
     )
 
     optimizer = optimizer_class(
         params_to_optimize,
-        lr=args.learning_rate,
+        lr=args["learning_rate"],
     )
 
-    noise_scheduler = DDPMScheduler.from_config(args.pretrained_model_name_or_path, subfolder="scheduler")
+    noise_scheduler = DDPMScheduler.from_config(args["pretrained_model_name_or_path"], subfolder="scheduler")
     
     train_dataset = DreamBoothDataset(
-        instance_data_root=args.instance_data_dir,
-        instance_prompt=args.instance_prompt,
-        class_data_root=args.class_data_dir if args.with_prior_preservation else None,
-        class_prompt=args.class_prompt,
+        instance_data_root=args["instance_data_dir"],
+        instance_prompt=args["instance_prompt"],
+        class_data_root=args["class_data_dir"] if args["with_prior_preservation"] else None,
+        class_prompt=args["class_prompt"],
         tokenizer=tokenizer,
-        size=args.resolution,
-        center_crop=args.center_crop,
+        size=args["resolution"],
+        center_crop=args["center_crop"],
     )
 
     def collate_fn(examples):
@@ -233,7 +207,7 @@ def training_function(text_encoder, vae, unet, args: TrainingArgs):
         pixel_values = [example["instance_images"] for example in examples]
 
         # concat class and instance examples for prior preservation
-        if args.with_prior_preservation:
+        if args["with_prior_preservation"]:
             input_ids += [example["class_prompt_ids"] for example in examples]
             pixel_values += [example["class_images"] for example in examples]
 
@@ -254,17 +228,17 @@ def training_function(text_encoder, vae, unet, args: TrainingArgs):
         return batch
     
     train_dataloader = torch.utils.data.DataLoader(
-        train_dataset, batch_size=args.train_batch_size, shuffle=True, collate_fn=collate_fn
+        train_dataset, batch_size=args["train_batch_size"], shuffle=True, collate_fn=collate_fn
     )
 
     lr_scheduler = get_scheduler(
-        args.lr_scheduler,
+        args["lr_scheduler"],
         optimizer=optimizer,
-        num_warmup_steps=args.lr_warmup_steps * args.gradient_accumulation_steps,
-        num_training_steps=args.max_train_steps * args.gradient_accumulation_steps,
+        num_warmup_steps=args["lr_warmup_steps"] * args["gradient_accumulation_steps"],
+        num_training_steps=args["max_train_steps"] * args["gradient_accumulation_steps"],
     )
 
-    if args.train_text_encoder:
+    if args["train_text_encoder"]:
         unet, text_encoder, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
             unet, text_encoder, optimizer, train_dataloader, lr_scheduler
         )
@@ -284,24 +258,24 @@ def training_function(text_encoder, vae, unet, args: TrainingArgs):
     # as these models are only used for inference, keeping weights in full precision is not required.
     vae.to(accelerator.device, dtype=weight_dtype)
     vae.decoder.to("cpu")
-    if not args.train_text_encoder:
+    if not args["train_text_encoder"]:
         text_encoder.to(accelerator.device, dtype=weight_dtype)
     
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
-    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
-    num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
+    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args["gradient_accumulation_steps"])
+    num_train_epochs = math.ceil(args["max_train_steps"] / num_update_steps_per_epoch)
   
     # Train!
-    total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
+    total_batch_size = args["train_batch_size"] * accelerator.num_processes * args["gradient_accumulation_steps"]
 
     logger.info("***** Running training *****")
     logger.info(f"  Num examples = {len(train_dataset)}")
-    logger.info(f"  Instantaneous batch size per device = {args.train_batch_size}")
+    logger.info(f"  Instantaneous batch size per device = {args['train_batch_size']}")
     logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
-    logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
-    logger.info(f"  Total optimization steps = {args.max_train_steps}")
+    logger.info(f"  Gradient Accumulation steps = {args['gradient_accumulation_steps']}")
+    logger.info(f"  Total optimization steps = {args['max_train_steps']}")
     # Only show the progress bar once on each machine.
-    progress_bar = tqdm(range(args.max_train_steps), disable=not accelerator.is_local_main_process)
+    progress_bar = tqdm(range(args["max_train_steps"]), disable=not accelerator.is_local_main_process)
     progress_bar.set_description("Steps")
     global_step = 0
 
@@ -338,7 +312,7 @@ def training_function(text_encoder, vae, unet, args: TrainingArgs):
                 else:
                     raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
 
-                if args.with_prior_preservation:
+                if args["with_prior_preservation"]:
                     # Chunk the noise and noise_pred into two parts and compute the loss on each part separately.
                     noise_pred, noise_pred_prior = torch.chunk(noise_pred, 2, dim=0)
                     target, target_prior = torch.chunk(target, 2, dim=0)
@@ -350,7 +324,7 @@ def training_function(text_encoder, vae, unet, args: TrainingArgs):
                     prior_loss = F.mse_loss(noise_pred_prior.float(), target_prior.float(), reduction="mean")
 
                     # Add the prior loss to the instance loss.
-                    loss = loss + args.prior_loss_weight * prior_loss
+                    loss = loss + args["prior_loss_weight"] * prior_loss
                 else:
                     loss = F.mse_loss(noise_pred.float(), target.float(), reduction="mean")
 
@@ -359,10 +333,10 @@ def training_function(text_encoder, vae, unet, args: TrainingArgs):
                 if accelerator.sync_gradients:
                     params_to_clip = (
                         itertools.chain(unet.parameters(), text_encoder.parameters())
-                        if args.train_text_encoder
+                        if args["train_text_encoder"]
                         else unet.parameters()
                     )
-                    accelerator.clip_grad_norm_(unet.parameters(), args.max_grad_norm)
+                    accelerator.clip_grad_norm_(unet.parameters(), args["max_grad_norm"])
                 optimizer.step()
                 optimizer.zero_grad()
 
@@ -371,20 +345,20 @@ def training_function(text_encoder, vae, unet, args: TrainingArgs):
                 progress_bar.update(1)
                 global_step += 1
 
-                if global_step % args.save_steps == 0:
+                if global_step % args["save_steps"] == 0:
                     if accelerator.is_main_process:
                         pipeline = StableDiffusionPipeline.from_pretrained(
-                            args.pretrained_model_name_or_path,
+                            args["pretrained_model_name_or_path"],
                             unet=accelerator.unwrap_model(unet),
                             text_encoder=accelerator.unwrap_model(text_encoder),
                         )
-                        save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
+                        save_path = os.path.join(args["output_dir"], f"checkpoint-{global_step}")
                         pipeline.save_pretrained(save_path)
 
             logs = {"loss": loss.detach().item()}
             progress_bar.set_postfix(**logs)
 
-            if global_step >= args.max_train_steps:
+            if global_step >= args["max_train_steps"]:
                 break
 
         accelerator.wait_for_everyone()
@@ -392,8 +366,20 @@ def training_function(text_encoder, vae, unet, args: TrainingArgs):
     # Create the pipeline using using the trained modules and save it.
     if accelerator.is_main_process:
         pipeline = StableDiffusionPipeline.from_pretrained(
-            args.pretrained_model_name_or_path,
+            args["pretrained_model_name_or_path"],
             unet=accelerator.unwrap_model(unet),
             text_encoder=accelerator.unwrap_model(text_encoder),
         )
-        pipeline.save_pretrained(args.output_dir)
+        pipeline.save_pretrained(args["output_dir"])
+
+
+def load_newly_trained_model(trained_model_output_dir, datatype=TorchDtype.FLOAT16.value):
+        pipe = StableDiffusionPipeline.from_pretrained(
+        trained_model_output_dir,
+        scheduler = DPMSolverMultistepScheduler.from_pretrained(trained_model_output_dir, subfolder="scheduler"),
+        torch_dtype=datatype).to("cuda")
+        return pipe
+
+def inference_dreambooth(pipe, prompt,  negative_prompt="" ,num_images_per_prompt=10, num_inference_steps=50, guidance_scale=7.5):
+    images = pipe(prompt, negative_prompt=negative_prompt, num_images_per_prompt=num_images_per_prompt, num_inference_steps=num_inference_steps, guidance_scale=guidance_scale).images #negative_prompt="ugly, boring, bad anatomy, cropped, blurry, pixelated, obscure, unnatural colors, poor lighting, dull, and unclear.",
+    return images
