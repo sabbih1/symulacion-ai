@@ -380,6 +380,6 @@ def load_newly_trained_model(trained_model_output_dir, datatype=TorchDtype.FLOAT
         torch_dtype=datatype).to("cuda")
         return pipe
 
-def inference_dreambooth(pipe, prompt,  negative_prompt="" ,num_images_per_prompt=10, num_inference_steps=50, guidance_scale=7.5):
+def inference_dreambooth(pipe, prompt, negative_prompt="" ,num_images_per_prompt=10, num_inference_steps=50, guidance_scale=7.5):
     images = pipe(prompt, negative_prompt=negative_prompt, num_images_per_prompt=num_images_per_prompt, num_inference_steps=num_inference_steps, guidance_scale=guidance_scale).images #negative_prompt="ugly, boring, bad anatomy, cropped, blurry, pixelated, obscure, unnatural colors, poor lighting, dull, and unclear.",
     return images

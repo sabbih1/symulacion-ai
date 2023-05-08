@@ -2,14 +2,13 @@ FROM pytorch/pytorch:latest
 
 # Install additional packages
 RUN apt-get update && apt-get install -y \
-    git \
-    && rm -rf /var/lib/apt/lists/*
+    git 
 
 # Clone the repository
-RUN git clone https://github.com/username/project.git
+# RUN git clone https://github.com/username/project.git
 
 # Set the working directory
-WORKDIR /project
+WORKDIR /symulacion-ai
 
 # Install the required packages
 RUN pip install -r requirements.txt

@@ -6,3 +6,4 @@ GUIDANE_SCALE = 7.5
 STRENGTH = 7.5
 DATA_TYPE = TorchDtype.FLOAT16.value
 DATA_EXTRACTION_PATH = "/home/fsuser/mi_workspace/symulacion/data"
+BASE_OUTPUT_IMG_PATH = "/home/fsuser/mi_workspace/symulacion/symulacion-ai/output_images_dir"
